@@ -5,7 +5,7 @@ import {
 } from './store.js';
 import type {
   AdverseEvent, DataBatch, EventAudit, EventSeverity, EventStatus, ExportAttempt, ExportJob,
-  OutboxMessage, QualityFinding, ReviewTask, SignalDefinition,
+  ExportStatus, OutboxMessage, QualityFinding, ReviewTask, SignalDefinition,
 } from './domain.js';
 
 const statusTransitions: Record<EventStatus, EventStatus[]> = {
@@ -14,6 +14,14 @@ const statusTransitions: Record<EventStatus, EventStatus[]> = {
   CONFIRMED: ['REPORTED', 'CLOSED'],
   REPORTED: ['CLOSED'],
   CLOSED: [],
+};
+
+const exportStatusTransitions: Record<ExportStatus, ExportStatus[]> = {
+  QUEUED: ['RUNNING', 'FAILED', 'CANCELLED'],
+  RUNNING: ['RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'],
+  COMPLETED: [],
+  FAILED: [],
+  CANCELLED: [],
 };
 
 export class DomainConflictError extends Error {
@@ -160,41 +168,47 @@ export function updateEventStatus(id: string, status: EventStatus, expectedVersi
   return clone(event);
 }
 
-function activeAttempt(exportId: string) { return exportAttempts.filter((item) => item.exportId === exportId).sort((a, b) => b.attempt - a.attempt)[0]; }
-function transitionExport(exportId: string, generation: string, status: ExportJob['status'], progress: number, records: number, error?: string) {
+function currentAttemptFor(job: ExportJob) {
+  return exportAttempts.find((item) => item.exportId === job.id && item.attempt === job.activeAttempt);
+}
+
+function transitionExport(exportId: string, attemptNo: number, generation: string, status: ExportStatus, progress: number, records: number, error?: string) {
   const job = exports.find((item) => item.id === exportId);
   if (!job) return;
-  const attempts = exportAttempts
-    .filter((item) => item.exportId === exportId)
-    .sort((left, right) => right.attempt - left.attempt);
-  const attempt = attempts[0];
-  if (!attempt) return;
-  const callbackAttempt = exportAttempts.find((item) => item.generation === generation);
-  const effectiveAttempt = callbackAttempt ?? attempt;
+  const attempt = currentAttemptFor(job);
+  if (!attempt || job.activeAttempt !== attemptNo || attempt.attempt !== attemptNo || attempt.generation !== generation) return;
+  if (job.status !== attempt.status) return;
+  if (!exportStatusTransitions[job.status].includes(status)) return;
+
+  if (status === 'RUNNING' && job.status === 'RUNNING' && progress < job.progress) return;
+  const nextProgress = status === 'COMPLETED' ? 100 : Math.max(job.progress, progress);
   job.status = status;
-  job.progress = progress;
+  job.progress = nextProgress;
   job.records = records;
-  job.failureReason = error;
-  effectiveAttempt.status = status;
-  effectiveAttempt.progress = progress;
-  effectiveAttempt.records = records;
-  if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') {
-    effectiveAttempt.finishedAt = now();
-  }
-  appendOutbox(job.id, 'EXPORT_JOB', `EXPORT_${status}`, effectiveAttempt.attempt, {
+  if (status === 'FAILED' || status === 'CANCELLED') job.failureReason = error;
+  if (status === 'COMPLETED') job.failureReason = undefined;
+
+  attempt.status = status;
+  attempt.progress = nextProgress;
+  attempt.records = records;
+  if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') attempt.finishedAt = now();
+  if (status === 'FAILED' || status === 'CANCELLED') attempt.error = error;
+
+  appendOutbox(job.id, 'EXPORT_JOB', `EXPORT_${status}`, attempt.attempt, {
     exportId,
-    attempt: effectiveAttempt.attempt,
+    attempt: attempt.attempt,
     generation,
     records,
-    progress,
+    progress: nextProgress,
     error: error ?? null,
   });
 }
 
 function scheduleExportAttempt(job: ExportJob, attempt: ExportAttempt) {
-  setTimeout(() => transitionExport(job.id, attempt.generation, 'RUNNING', 25, Math.ceil(job.records * 0.25)), 120);
-  setTimeout(() => transitionExport(job.id, attempt.generation, 'RUNNING', 70, Math.ceil(job.records * 0.7)), 420);
-  setTimeout(() => transitionExport(job.id, attempt.generation, 'COMPLETED', 100, job.records), 900);
+  const totalRecords = attempt.records;
+  setTimeout(() => transitionExport(job.id, attempt.attempt, attempt.generation, 'RUNNING', 25, Math.ceil(totalRecords * 0.25)), 120);
+  setTimeout(() => transitionExport(job.id, attempt.attempt, attempt.generation, 'RUNNING', 70, Math.ceil(totalRecords * 0.7)), 420);
+  setTimeout(() => transitionExport(job.id, attempt.attempt, attempt.generation, 'COMPLETED', 100, totalRecords), 900);
 }
 
 export function createExport(studyId: string, type: ExportJob['type'], requestedBy = 'system') {
@@ -224,8 +238,10 @@ export function retryExport(exportId: string, requestedBy = 'system') {
 export function cancelExport(exportId: string) {
   const job = exports.find((item) => item.id === exportId);
   if (!job) return undefined;
-  if (['COMPLETED', 'CANCELLED'].includes(job.status)) return clone(job);
-  transitionExport(exportId, activeAttempt(exportId)?.generation ?? '', 'CANCELLED', job.progress, job.records, 'cancelled by user');
+  if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(job.status)) return clone(job);
+  const attempt = currentAttemptFor(job);
+  if (!attempt) return clone(job);
+  transitionExport(exportId, attempt.attempt, attempt.generation, 'CANCELLED', job.progress, job.records, 'cancelled by user');
   return clone(job);
 }
 
